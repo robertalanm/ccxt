@@ -13,9 +13,11 @@ except NameError:
     basestring = str  # Python 2
 import hashlib
 import math
+import json
 from ccxt.base.errors import ExchangeError
 from ccxt.base.errors import AuthenticationError
 from ccxt.base.errors import PermissionDenied
+from ccxt.base.errors import AccountSuspended
 from ccxt.base.errors import ArgumentsRequired
 from ccxt.base.errors import InsufficientFunds
 from ccxt.base.errors import InvalidOrder
@@ -24,7 +26,7 @@ from ccxt.base.errors import DDoSProtection
 from ccxt.base.errors import ExchangeNotAvailable
 
 
-class bibox (Exchange):
+class bibox(Exchange):
 
     def describe(self):
         return self.deep_extend(super(bibox, self).describe(), {
@@ -68,7 +70,7 @@ class bibox (Exchange):
                 'api': 'https://api.bibox.com',
                 'www': 'https://www.bibox.com',
                 'doc': [
-                    'https://github.com/Biboxcom/API_Docs_en/wiki',
+                    'https://biboxcom.github.io/en/',
                 ],
                 'fees': 'https://bibox.zendesk.com/hc/en-us/articles/360002336133',
                 'referral': 'https://www.bibox.com/signPage?id=11114745&lang=en',
@@ -111,8 +113,9 @@ class bibox (Exchange):
                 },
             },
             'exceptions': {
-                '2021': InsufficientFunds,  # Insufficient balance available for withdrawal
+                '2011': AccountSuspended,  # Account is locked
                 '2015': AuthenticationError,  # Google authenticator is wrong
+                '2021': InsufficientFunds,  # Insufficient balance available for withdrawal
                 '2027': InsufficientFunds,  # Insufficient balance available(for trade)
                 '2033': OrderNotFound,  # operation failednot  Orders have been completed or revoked
                 '2067': InvalidOrder,  # Does not support market orders
@@ -126,6 +129,7 @@ class bibox (Exchange):
             },
             'commonCurrencies': {
                 'KEY': 'Bihu',
+                'MTC': 'MTC Mesh Network',  # conflict with MTC Docademic doc.com Token https://github.com/ccxt/ccxt/issues/6081 https://github.com/ccxt/ccxt/issues/3025
                 'PAI': 'PCHAIN',
             },
         })
@@ -764,8 +768,14 @@ class bibox (Exchange):
             }, params),
         }
         response = await self.privatePostTransfer(request)
-        address = self.safe_string(response, 'result')
-        tag = None  # todo: figure self out
+        #
+        #     {
+        #         "result":"{\"account\":\"PERSONALLY OMITTED\",\"memo\":\"PERSONALLY OMITTED\"}","cmd":"transfer/transferIn"
+        #     }
+        #
+        result = json.loads(self.safe_string(response, 'result'))
+        address = self.safe_string(result, 'account')
+        tag = self.safe_string(result, 'memo')
         return {
             'currency': code,
             'address': address,
@@ -778,9 +788,9 @@ class bibox (Exchange):
         await self.load_markets()
         currency = self.currency(code)
         if self.password is None:
-            if not('trade_pwd' in list(params.keys())):
+            if not ('trade_pwd' in params):
                 raise ExchangeError(self.id + ' withdraw() requires self.password set on the exchange instance or a trade_pwd parameter')
-        if not('totp_code' in list(params.keys())):
+        if not ('totp_code' in params):
             raise ExchangeError(self.id + ' withdraw() requires a totp_code parameter for 2FA authentication')
         request = {
             'trade_pwd': self.password,
@@ -861,13 +871,10 @@ class bibox (Exchange):
             if 'code' in response['error']:
                 code = self.safe_string(response['error'], 'code')
                 feedback = self.id + ' ' + body
-                exceptions = self.exceptions
-                if code in exceptions:
-                    raise exceptions[code](feedback)
-                else:
-                    raise ExchangeError(feedback)
-            raise ExchangeError(self.id + ': "error" in response: ' + body)
-        if not('result' in list(response.keys())):
+                self.throw_exactly_matched_exception(self.exceptions, code, feedback)
+                raise ExchangeError(feedback)
+            raise ExchangeError(self.id + ' ' + body)
+        if not ('result' in response):
             raise ExchangeError(self.id + ' ' + body)
 
     async def request(self, path, api='public', method='GET', params={}, headers=None, body=None):

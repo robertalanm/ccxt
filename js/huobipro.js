@@ -3,7 +3,7 @@
 //  ---------------------------------------------------------------------------
 
 const Exchange = require ('./base/Exchange');
-const { AuthenticationError, ExchangeError, ExchangeNotAvailable, InvalidOrder, OrderNotFound, InsufficientFunds, ArgumentsRequired, BadSymbol } = require ('./base/errors');
+const { AuthenticationError, ExchangeError, ExchangeNotAvailable, InvalidOrder, OrderNotFound, InsufficientFunds, ArgumentsRequired, BadSymbol, BadRequest, RequestTimeout } = require ('./base/errors');
 
 //  ---------------------------------------------------------------------------
 
@@ -41,6 +41,7 @@ module.exports = class huobipro extends Exchange {
                 '15m': '15min',
                 '30m': '30min',
                 '1h': '60min',
+                '4h': '4hour',
                 '1d': '1day',
                 '1w': '1week',
                 '1M': '1mon',
@@ -89,6 +90,7 @@ module.exports = class huobipro extends Exchange {
                     'get': [
                         'account/accounts', // 查询当前用户的所有账户(即account-id)
                         'account/accounts/{id}/balance', // 查询指定账户的余额
+                        'account/history',
                         'order/openOrders',
                         'order/orders',
                         'order/orders/{id}', // 查询某个订单详情
@@ -133,6 +135,7 @@ module.exports = class huobipro extends Exchange {
             'exceptions': {
                 'exact': {
                     // err-code
+                    'timeout': RequestTimeout, // {"ts":1571653730865,"status":"error","err-code":"timeout","err-msg":"Request Timeout"}
                     'gateway-internal-error': ExchangeNotAvailable, // {"status":"error","err-code":"gateway-internal-error","err-msg":"Failed to load data. Try again later.","data":null}
                     'account-frozen-balance-insufficient-error': InsufficientFunds, // {"status":"error","err-code":"account-frozen-balance-insufficient-error","err-msg":"trade account balance is not enough, left: `0.0027`","data":null}
                     'invalid-amount': InvalidOrder, // eg "Paramemter `amount` is invalid."
@@ -148,6 +151,8 @@ module.exports = class huobipro extends Exchange {
                     'base-record-invalid': OrderNotFound, // https://github.com/ccxt/ccxt/issues/5750
                     // err-msg
                     'invalid symbol': BadSymbol, // {"ts":1568813334794,"status":"error","err-code":"invalid-parameter","err-msg":"invalid symbol"}
+                    'invalid-parameter': BadRequest, // {"ts":1576210479343,"status":"error","err-code":"invalid-parameter","err-msg":"symbol trade not open now"}
+                    'base-symbol-trade-disabled': BadSymbol, // {"status":"error","err-code":"base-symbol-trade-disabled","err-msg":"Trading is disabled for this symbol","data":null}
                 },
             },
             'options': {
@@ -161,6 +166,10 @@ module.exports = class huobipro extends Exchange {
                 'language': 'en-US',
             },
             'commonCurrencies': {
+                // https://github.com/ccxt/ccxt/issues/6081
+                // https://github.com/ccxt/ccxt/issues/3365
+                // https://github.com/ccxt/ccxt/issues/2873
+                'GET': 'Themis', // conflict with GET (Guaranteed Entrance Token, GET Protocol)
                 'HOT': 'Hydro Protocol', // conflict with HOT (Holo) https://github.com/ccxt/ccxt/issues/4929
             },
         });
@@ -257,6 +266,7 @@ module.exports = class huobipro extends Exchange {
             const maker = (base === 'OMG') ? 0 : 0.2 / 100;
             const taker = (base === 'OMG') ? 0 : 0.2 / 100;
             const minAmount = this.safeFloat (market, 'min-order-amt', Math.pow (10, -precision['amount']));
+            const maxAmount = this.safeFloat (market, 'max-order-amt');
             const minCost = this.safeFloat (market, 'min-order-value', 0);
             const state = this.safeString (market, 'state');
             const active = (state === 'online');
@@ -274,7 +284,7 @@ module.exports = class huobipro extends Exchange {
                 'limits': {
                     'amount': {
                         'min': minAmount,
-                        'max': undefined,
+                        'max': maxAmount,
                     },
                     'price': {
                         'min': Math.pow (10, -precision['price']),
@@ -445,7 +455,7 @@ module.exports = class huobipro extends Exchange {
         if (filledPoints !== undefined) {
             if ((feeCost === undefined) || (feeCost === 0.0)) {
                 feeCost = filledPoints;
-                feeCurrency = this.safeCurrencyCode ('HBPOINT');
+                feeCurrency = this.safeCurrencyCode (this.safeString (trade, 'fee-deduct-currency'));
             }
         }
         if (feeCost !== undefined) {
@@ -888,12 +898,11 @@ module.exports = class huobipro extends Exchange {
         const market = this.market (symbol);
         const request = {
             'account-id': this.accounts[0]['id'],
-            'amount': this.amountToPrecision (symbol, amount),
             'symbol': market['id'],
             'type': side + '-' + type,
         };
-        if (this.options['createMarketBuyOrderRequiresPrice']) {
-            if ((type === 'market') && (side === 'buy')) {
+        if ((type === 'market') && (side === 'buy')) {
+            if (this.options['createMarketBuyOrderRequiresPrice']) {
                 if (price === undefined) {
                     throw new InvalidOrder (this.id + " market buy order requires price argument to calculate cost (total amount of quote currency to spend for buying, amount * price). To switch off this warning exception and specify cost in the amount argument, set .options['createMarketBuyOrderRequiresPrice'] = false. Make sure you know what you're doing.");
                 } else {
@@ -902,9 +911,13 @@ module.exports = class huobipro extends Exchange {
                     // more about it here: https://github.com/ccxt/ccxt/pull/4395
                     // we use priceToPrecision instead of amountToPrecision here
                     // because in this case the amount is in the quote currency
-                    request['amount'] = this.priceToPrecision (symbol, parseFloat (amount) * parseFloat (price));
+                    request['amount'] = this.costToPrecision (symbol, parseFloat (amount) * parseFloat (price));
                 }
+            } else {
+                request['amount'] = this.costToPrecision (symbol, amount);
             }
+        } else {
+            request['amount'] = this.amountToPrecision (symbol, amount);
         }
         if (type === 'limit' || type === 'ioc' || type === 'limit-maker') {
             request['price'] = this.priceToPrecision (symbol, price);
@@ -1001,12 +1014,16 @@ module.exports = class huobipro extends Exchange {
         if (api === 'private') {
             this.checkRequiredCredentials ();
             const timestamp = this.ymdhms (this.milliseconds (), 'T');
-            const request = this.keysort (this.extend ({
+            let request = {
                 'SignatureMethod': 'HmacSHA256',
                 'SignatureVersion': '2',
                 'AccessKeyId': this.apiKey,
                 'Timestamp': timestamp,
-            }, query));
+            };
+            if (method !== 'POST') {
+                request = this.extend (request, query);
+            }
+            request = this.keysort (request);
             let auth = this.urlencode (request);
             // unfortunately, PHP demands double quotes for the escaped newline symbol
             // eslint-disable-next-line quotes
@@ -1046,15 +1063,10 @@ module.exports = class huobipro extends Exchange {
             const status = this.safeString (response, 'status');
             if (status === 'error') {
                 const code = this.safeString (response, 'err-code');
-                const feedback = this.id + ' ' + this.json (response);
-                const exceptions = this.exceptions['exact'];
-                if (code in exceptions) {
-                    throw new exceptions[code] (feedback);
-                }
+                const feedback = this.id + ' ' + body;
+                this.throwExactlyMatchedException (this.exceptions['exact'], code, feedback);
                 const message = this.safeString (response, 'err-msg');
-                if (message in exceptions) {
-                    throw new exceptions[message] (feedback);
-                }
+                this.throwExactlyMatchedException (this.exceptions['exact'], message, feedback);
                 throw new ExchangeError (feedback);
             }
         }

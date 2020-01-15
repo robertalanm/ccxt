@@ -9,14 +9,16 @@ import math
 from ccxt.base.errors import ExchangeError
 from ccxt.base.errors import AuthenticationError
 from ccxt.base.errors import ArgumentsRequired
+from ccxt.base.errors import BadRequest
 from ccxt.base.errors import BadSymbol
 from ccxt.base.errors import InsufficientFunds
 from ccxt.base.errors import InvalidOrder
 from ccxt.base.errors import OrderNotFound
 from ccxt.base.errors import ExchangeNotAvailable
+from ccxt.base.errors import RequestTimeout
 
 
-class huobipro (Exchange):
+class huobipro(Exchange):
 
     def describe(self):
         return self.deep_extend(super(huobipro, self).describe(), {
@@ -51,6 +53,7 @@ class huobipro (Exchange):
                 '15m': '15min',
                 '30m': '30min',
                 '1h': '60min',
+                '4h': '4hour',
                 '1d': '1day',
                 '1w': '1week',
                 '1M': '1mon',
@@ -99,6 +102,7 @@ class huobipro (Exchange):
                     'get': [
                         'account/accounts',  # 查询当前用户的所有账户(即account-id)
                         'account/accounts/{id}/balance',  # 查询指定账户的余额
+                        'account/history',
                         'order/openOrders',
                         'order/orders',
                         'order/orders/{id}',  # 查询某个订单详情
@@ -143,6 +147,7 @@ class huobipro (Exchange):
             'exceptions': {
                 'exact': {
                     # err-code
+                    'timeout': RequestTimeout,  # {"ts":1571653730865,"status":"error","err-code":"timeout","err-msg":"Request Timeout"}
                     'gateway-internal-error': ExchangeNotAvailable,  # {"status":"error","err-code":"gateway-internal-error","err-msg":"Failed to load data. Try again later.","data":null}
                     'account-frozen-balance-insufficient-error': InsufficientFunds,  # {"status":"error","err-code":"account-frozen-balance-insufficient-error","err-msg":"trade account balance is not enough, left: `0.0027`","data":null}
                     'invalid-amount': InvalidOrder,  # eg "Paramemter `amount` is invalid."
@@ -158,6 +163,8 @@ class huobipro (Exchange):
                     'base-record-invalid': OrderNotFound,  # https://github.com/ccxt/ccxt/issues/5750
                     # err-msg
                     'invalid symbol': BadSymbol,  # {"ts":1568813334794,"status":"error","err-code":"invalid-parameter","err-msg":"invalid symbol"}
+                    'invalid-parameter': BadRequest,  # {"ts":1576210479343,"status":"error","err-code":"invalid-parameter","err-msg":"symbol trade not open now"}
+                    'base-symbol-trade-disabled': BadSymbol,  # {"status":"error","err-code":"base-symbol-trade-disabled","err-msg":"Trading is disabled for self symbol","data":null}
                 },
             },
             'options': {
@@ -171,6 +178,10 @@ class huobipro (Exchange):
                 'language': 'en-US',
             },
             'commonCurrencies': {
+                # https://github.com/ccxt/ccxt/issues/6081
+                # https://github.com/ccxt/ccxt/issues/3365
+                # https://github.com/ccxt/ccxt/issues/2873
+                'GET': 'Themis',  # conflict with GET(Guaranteed Entrance Token, GET Protocol)
                 'HOT': 'Hydro Protocol',  # conflict with HOT(Holo) https://github.com/ccxt/ccxt/issues/4929
             },
         })
@@ -260,6 +271,7 @@ class huobipro (Exchange):
             maker = 0 if (base == 'OMG') else 0.2 / 100
             taker = 0 if (base == 'OMG') else 0.2 / 100
             minAmount = self.safe_float(market, 'min-order-amt', math.pow(10, -precision['amount']))
+            maxAmount = self.safe_float(market, 'max-order-amt')
             minCost = self.safe_float(market, 'min-order-value', 0)
             state = self.safe_string(market, 'state')
             active = (state == 'online')
@@ -277,7 +289,7 @@ class huobipro (Exchange):
                 'limits': {
                     'amount': {
                         'min': minAmount,
-                        'max': None,
+                        'max': maxAmount,
                     },
                     'price': {
                         'min': math.pow(10, -precision['price']),
@@ -423,7 +435,7 @@ class huobipro (Exchange):
         if filledPoints is not None:
             if (feeCost is None) or (feeCost == 0.0):
                 feeCost = filledPoints
-                feeCurrency = self.safe_currency_code('HBPOINT')
+                feeCurrency = self.safe_currency_code(self.safe_string(trade, 'fee-deduct-currency'))
         if feeCost is not None:
             fee = {
                 'cost': feeCost,
@@ -815,12 +827,11 @@ class huobipro (Exchange):
         market = self.market(symbol)
         request = {
             'account-id': self.accounts[0]['id'],
-            'amount': self.amount_to_precision(symbol, amount),
             'symbol': market['id'],
             'type': side + '-' + type,
         }
-        if self.options['createMarketBuyOrderRequiresPrice']:
-            if (type == 'market') and (side == 'buy'):
+        if (type == 'market') and (side == 'buy'):
+            if self.options['createMarketBuyOrderRequiresPrice']:
                 if price is None:
                     raise InvalidOrder(self.id + " market buy order requires price argument to calculate cost(total amount of quote currency to spend for buying, amount * price). To switch off self warning exception and specify cost in the amount argument, set .options['createMarketBuyOrderRequiresPrice'] = False. Make sure you know what you're doing.")
                 else:
@@ -829,7 +840,11 @@ class huobipro (Exchange):
                     # more about it here: https://github.com/ccxt/ccxt/pull/4395
                     # we use priceToPrecision instead of amountToPrecision here
                     # because in self case the amount is in the quote currency
-                    request['amount'] = self.price_to_precision(symbol, float(amount) * float(price))
+                    request['amount'] = self.cost_to_precision(symbol, float(amount) * float(price))
+            else:
+                request['amount'] = self.cost_to_precision(symbol, amount)
+        else:
+            request['amount'] = self.amount_to_precision(symbol, amount)
         if type == 'limit' or type == 'ioc' or type == 'limit-maker':
             request['price'] = self.price_to_precision(symbol, price)
         method = self.options['createOrderMethod']
@@ -916,12 +931,15 @@ class huobipro (Exchange):
         if api == 'private':
             self.check_required_credentials()
             timestamp = self.ymdhms(self.milliseconds(), 'T')
-            request = self.keysort(self.extend({
+            request = {
                 'SignatureMethod': 'HmacSHA256',
                 'SignatureVersion': '2',
                 'AccessKeyId': self.apiKey,
                 'Timestamp': timestamp,
-            }, query))
+            }
+            if method != 'POST':
+                request = self.extend(request, query)
+            request = self.keysort(request)
             auth = self.urlencode(request)
             # unfortunately, PHP demands double quotes for the escaped newline symbol
             # eslint-disable-next-line quotes
@@ -956,13 +974,10 @@ class huobipro (Exchange):
             status = self.safe_string(response, 'status')
             if status == 'error':
                 code = self.safe_string(response, 'err-code')
-                feedback = self.id + ' ' + self.json(response)
-                exceptions = self.exceptions['exact']
-                if code in exceptions:
-                    raise exceptions[code](feedback)
+                feedback = self.id + ' ' + body
+                self.throw_exactly_matched_exception(self.exceptions['exact'], code, feedback)
                 message = self.safe_string(response, 'err-msg')
-                if message in exceptions:
-                    raise exceptions[message](feedback)
+                self.throw_exactly_matched_exception(self.exceptions['exact'], message, feedback)
                 raise ExchangeError(feedback)
 
     async def fetch_deposits(self, code=None, since=None, limit=None, params={}):

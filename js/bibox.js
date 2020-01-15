@@ -3,7 +3,7 @@
 //  ---------------------------------------------------------------------------
 
 const Exchange = require ('./base/Exchange');
-const { ExchangeError, ArgumentsRequired, AuthenticationError, DDoSProtection, ExchangeNotAvailable, InvalidOrder, OrderNotFound, PermissionDenied, InsufficientFunds } = require ('./base/errors');
+const { ExchangeError, AccountSuspended, ArgumentsRequired, AuthenticationError, DDoSProtection, ExchangeNotAvailable, InvalidOrder, OrderNotFound, PermissionDenied, InsufficientFunds } = require ('./base/errors');
 
 //  ---------------------------------------------------------------------------
 
@@ -50,7 +50,7 @@ module.exports = class bibox extends Exchange {
                 'api': 'https://api.bibox.com',
                 'www': 'https://www.bibox.com',
                 'doc': [
-                    'https://github.com/Biboxcom/API_Docs_en/wiki',
+                    'https://biboxcom.github.io/en/',
                 ],
                 'fees': 'https://bibox.zendesk.com/hc/en-us/articles/360002336133',
                 'referral': 'https://www.bibox.com/signPage?id=11114745&lang=en',
@@ -93,8 +93,9 @@ module.exports = class bibox extends Exchange {
                 },
             },
             'exceptions': {
-                '2021': InsufficientFunds, // Insufficient balance available for withdrawal
+                '2011': AccountSuspended, // Account is locked
                 '2015': AuthenticationError, // Google authenticator is wrong
+                '2021': InsufficientFunds, // Insufficient balance available for withdrawal
                 '2027': InsufficientFunds, // Insufficient balance available (for trade)
                 '2033': OrderNotFound, // operation failed! Orders have been completed or revoked
                 '2067': InvalidOrder, // Does not support market orders
@@ -108,6 +109,7 @@ module.exports = class bibox extends Exchange {
             },
             'commonCurrencies': {
                 'KEY': 'Bihu',
+                'MTC': 'MTC Mesh Network', // conflict with MTC Docademic doc.com Token https://github.com/ccxt/ccxt/issues/6081 https://github.com/ccxt/ccxt/issues/3025
                 'PAI': 'PCHAIN',
             },
         });
@@ -814,8 +816,14 @@ module.exports = class bibox extends Exchange {
             }, params),
         };
         const response = await this.privatePostTransfer (request);
-        const address = this.safeString (response, 'result');
-        const tag = undefined; // todo: figure this out
+        //
+        //     {
+        //         "result":"{\"account\":\"PERSONALLY OMITTED\",\"memo\":\"PERSONALLY OMITTED\"}","cmd":"transfer/transferIn"
+        //     }
+        //
+        const result = JSON.parse (this.safeString (response, 'result'));
+        const address = this.safeString (result, 'account');
+        const tag = this.safeString (result, 'memo');
         return {
             'currency': code,
             'address': address,
@@ -925,14 +933,10 @@ module.exports = class bibox extends Exchange {
             if ('code' in response['error']) {
                 const code = this.safeString (response['error'], 'code');
                 const feedback = this.id + ' ' + body;
-                const exceptions = this.exceptions;
-                if (code in exceptions) {
-                    throw new exceptions[code] (feedback);
-                } else {
-                    throw new ExchangeError (feedback);
-                }
+                this.throwExactlyMatchedException (this.exceptions, code, feedback);
+                throw new ExchangeError (feedback);
             }
-            throw new ExchangeError (this.id + ': "error" in response: ' + body);
+            throw new ExchangeError (this.id + ' ' + body);
         }
         if (!('result' in response)) {
             throw new ExchangeError (this.id + ' ' + body);
